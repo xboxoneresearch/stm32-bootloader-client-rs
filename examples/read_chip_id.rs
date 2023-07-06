@@ -3,7 +3,7 @@
 // See LICENSE-APACHE and LICENSE-MIT for details.
 
 use anyhow::Result;
-use stm32_bootloader_client::Stm32;
+use stm32_bootloader_client::{Stm32, Stm32i2c};
 
 fn main() {
     if let Err(error) = run() {
@@ -29,7 +29,7 @@ fn run() -> Result<()> {
     // This is the address for I2C1 on the STM32G0 series. See AN2606 for
     // the list of addresses for other parts.
     let config = stm32_bootloader_client::Config::i2c_address(0x51);
-    let mut stm32 = Stm32::new(dev, config);
+    let mut stm32 = Stm32::new(Stm32i2c::new(&mut dev, config));
     let chip_id = stm32.get_chip_id()?;
     println!("Found chip ID: 0x{chip_id:x}");
 

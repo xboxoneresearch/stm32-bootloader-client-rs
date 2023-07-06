@@ -7,8 +7,7 @@
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 
-use core::ops::Deref;
-use core::ops::DerefMut;
+use core::marker::PhantomData;
 use embedded_hal::blocking::i2c::Read;
 use embedded_hal::blocking::i2c::Write;
 
@@ -61,10 +60,72 @@ pub enum Error {
     EraseFailed,
 }
 
-pub struct Stm32<'a, I2c: Write + Read, DelayMs> {
-    dev: MaybeOwned<'a, I2c>,
-    delay: MaybeOwned<'a, DelayMs>,
+pub trait BootloaderIO<'a> {
+    fn write(&mut self, bytes: &[u8]) -> Result<()>;
+    fn read(&mut self, out: &mut [u8]) -> Result<()>;
+    fn read_with_timeout(&mut self, out: &mut [u8]) -> Result<()>;
+    fn get_config_erase_wait_ms(&self) -> u32;
+}
+
+pub struct Stm32i2c<'a, I2c: Write + Read> {
+    dev: &'a mut I2c,
     config: Config,
+}
+
+impl<'a, E, I2c> Stm32i2c<'a, I2c>
+where
+    E: core::fmt::Debug,
+    I2c: Write<Error = E> + Read<Error = E>,
+{
+    pub fn new(dev: &'a mut I2c, config: Config) -> Self {
+        Stm32i2c { dev, config }
+    }
+}
+
+impl<'a, E, I2c> BootloaderIO<'a> for Stm32i2c<'a, I2c>
+where
+    E: core::fmt::Debug,
+    I2c: Write<Error = E> + Read<Error = E>,
+{
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.dev
+            .write(self.config.i2c_address, bytes)
+            .map_err(|error| {
+                log_error(&error);
+                Error::TransportError
+            })
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<()> {
+        self.dev
+            .read(self.config.i2c_address, out)
+            .map_err(|error| {
+                log_error(&error);
+                Error::TransportError
+            })
+    }
+
+    fn read_with_timeout(&mut self, out: &mut [u8]) -> Result<()> {
+        // TODO: Implement timeout mechanism
+        const MAX_ATTEMPTS: u32 = 10000;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let result = self.read(out);
+            if result.is_ok() || attempts == MAX_ATTEMPTS {
+                return result;
+            }
+        }
+    }
+
+    fn get_config_erase_wait_ms(&self) -> u32 {
+        self.config.mass_erase_max_ms
+    }
+}
+
+pub struct Stm32<'a, D: BootloaderIO<'a>> {
+    dev: D,
+    _phantom: &'a PhantomData<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,80 +134,27 @@ pub struct Progress {
     pub bytes_total: usize,
 }
 
-#[cfg(feature = "std")]
-impl<E, I2c> Stm32<'static, I2c, StdDelay>
+impl<'a, D> Stm32<'a, D>
 where
-    E: core::fmt::Debug,
-    I2c: Write<Error = E> + Read<Error = E>,
-{
-    pub fn new(dev: I2c, config: Config) -> Stm32<'static, I2c, StdDelay> {
-        Self {
-            dev: MaybeOwned::Owned(dev),
-            delay: MaybeOwned::Owned(StdDelay),
-            config,
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl<'a, E, I2c> Stm32<'a, I2c, StdDelay>
-where
-    E: core::fmt::Debug,
-    I2c: Write<Error = E> + Read<Error = E>,
-{
-    /// Construct a new instance where we only borrow the I2C implementation.
-    /// This is useful if you have other things on the I2C bus that want to
-    /// communicate with so don't want to give up ownership of the I2C bus.
-    pub fn borrowed(dev: &'a mut I2c, config: Config) -> Stm32<'a, I2c, StdDelay> {
-        Self {
-            dev: MaybeOwned::Borrowed(dev),
-            delay: MaybeOwned::Owned(StdDelay),
-            config,
-        }
-    }
-}
-
-impl<E, I2c, Delay> Stm32<'static, I2c, Delay>
-where
-    E: core::fmt::Debug,
-    I2c: Write<Error = E> + Read<Error = E>,
-    Delay: embedded_hal::blocking::delay::DelayMs<u32>,
-{
-    /// Constructs a new instance with a custom delay implementation.
-    pub fn new_with_delay(dev: I2c, delay: Delay, config: Config) -> Stm32<'static, I2c, Delay> {
-        Self {
-            dev: MaybeOwned::Owned(dev),
-            delay: MaybeOwned::Owned(delay),
-            config,
-        }
-    }
-}
-
-impl<'a, E, I2c, Delay> Stm32<'a, I2c, Delay>
-where
-    E: core::fmt::Debug,
-    I2c: Write<Error = E> + Read<Error = E>,
-    Delay: embedded_hal::blocking::delay::DelayMs<u32>,
+    D: BootloaderIO<'a>,
 {
     /// Borrows both the I2C implementation and a custom delay.
-    pub fn borrowed_with_delay(
-        dev: &'a mut I2c,
-        delay: &'a mut Delay,
-        config: Config,
-    ) -> Stm32<'a, I2c, Delay> {
+    pub fn new(dev: D) -> Stm32<'a, D> {
         Self {
-            dev: MaybeOwned::Borrowed(dev),
-            delay: MaybeOwned::Borrowed(delay),
-            config,
+            dev,
+            _phantom: &PhantomData,
         }
     }
+
+    /// Release any borrows
+    pub fn release(self) {}
 
     pub fn get_chip_id(&mut self) -> Result<u16> {
         self.send_command(Command::GetId)?;
         // For STM32, the first byte will always be a 1 and the payload will
         // always be 3 bytes.
         let mut buffer = [0u8; 3];
-        self.read(&mut buffer)?;
+        self.dev.read(&mut buffer)?;
         self.get_ack_for_command(Command::GetId)?;
         Ok(u16::from_be_bytes([buffer[1], buffer[2]]))
     }
@@ -161,9 +169,9 @@ where
         let mut buffer = [0u8; 2];
         buffer[0] = (out.len() - 1) as u8;
         buffer[1] = checksum(&buffer[0..1]);
-        self.write(&buffer)?;
+        self.dev.write(&buffer)?;
         self.get_ack_for_command(Command::ReadMemory)?;
-        self.read(out)?;
+        self.dev.read(out)?;
 
         Ok(())
     }
@@ -180,7 +188,7 @@ where
         buffer[0] = (data.len() - 1) as u8;
         buffer[1..1 + data.len()].copy_from_slice(data);
         buffer[1 + data.len()] = checksum(&buffer[0..1 + data.len()]);
-        self.write(&buffer[..data.len() + 2])?;
+        self.dev.write(&buffer[..data.len() + 2])?;
 
         self.get_ack_for_command(Command::WriteMemory)
     }
@@ -237,13 +245,13 @@ where
     }
 
     /// Erase the flash of the STM32.
-    pub fn erase_flash(&mut self) -> Result<()> {
+    pub fn erase_flash(&mut self, delay_ms: &mut dyn Fn(u32)) -> Result<()> {
         self.send_command(Command::Erase)?;
         let mut buffer = [0u8; 3];
         buffer[0..2].copy_from_slice(&SPECIAL_ERASE_ALL);
         buffer[2] = checksum(&buffer[..2]);
-        self.write(&buffer)?;
-        self.delay.delay_ms(self.config.mass_erase_max_ms);
+        self.dev.write(&buffer)?;
+        delay_ms(self.dev.get_config_erase_wait_ms());
         self.get_ack().map_err(|_| Error::EraseFailed)
     }
 
@@ -251,7 +259,7 @@ where
     pub fn get_bootloader_version(&mut self) -> Result<u8> {
         self.send_command(Command::GetVersion)?;
         let mut buffer = [0];
-        self.read(&mut buffer)?;
+        self.dev.read(&mut buffer)?;
         self.get_ack_for_command(Command::GetVersion)?;
         Ok(buffer[0])
     }
@@ -263,46 +271,15 @@ where
         self.send_address(address)
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.dev
-            .write(self.config.i2c_address, bytes)
-            .map_err(|error| {
-                log_error(&error);
-                Error::TransportError
-            })
-    }
-
-    fn read(&mut self, out: &mut [u8]) -> Result<()> {
-        self.dev
-            .read(self.config.i2c_address, out)
-            .map_err(|error| {
-                log_error(&error);
-                Error::TransportError
-            })
-    }
-
-    fn read_with_timeout(&mut self, out: &mut [u8]) -> Result<()> {
-        // TODO: Implement timeout mechanism
-        const MAX_ATTEMPTS: u32 = 10000;
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            let result = self.read(out);
-            if result.is_ok() || attempts == MAX_ATTEMPTS {
-                return result;
-            }
-        }
-    }
-
     fn send_command(&mut self, command: Command) -> Result<()> {
         let command_u8 = command as u8;
-        self.write(&[command_u8, !command_u8])?;
+        self.dev.write(&[command_u8, !command_u8])?;
         self.get_ack_for_command(command)
     }
 
     fn get_ack(&mut self) -> Result<()> {
         let mut response = [0u8; 1];
-        self.read_with_timeout(&mut response)?;
+        self.dev.read_with_timeout(&mut response)?;
         match response[0] {
             BOOTLOADER_ACK => Ok(()),
             BOOTLOADER_NACK => Err(Error::Nack),
@@ -322,38 +299,8 @@ where
         let mut buffer = [0u8; 5];
         buffer[0..4].copy_from_slice(&address.to_be_bytes());
         buffer[4] = checksum(&buffer[0..4]);
-        self.write(&buffer)?;
+        self.dev.write(&buffer)?;
         self.get_ack()
-    }
-}
-
-/// Wraps either an owned value, or a mutable reference. This sounds a little
-/// bit like std::borrow::Cow, but is actually quite different in that (a) it
-/// doesn't rely on std, (b) it mutates via either variant without having to
-/// switch to an owned variant and (c) it works with types that we can't, or
-/// don't want to clone.
-enum MaybeOwned<'a, T> {
-    Borrowed(&'a mut T),
-    Owned(T),
-}
-
-impl<'a, T> Deref for MaybeOwned<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            MaybeOwned::Borrowed(x) => *x,
-            MaybeOwned::Owned(x) => x,
-        }
-    }
-}
-
-impl<'a, T> DerefMut for MaybeOwned<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            MaybeOwned::Borrowed(x) => *x,
-            MaybeOwned::Owned(x) => x,
-        }
     }
 }
 
@@ -452,8 +399,8 @@ mod tests {
             mock_read(&[BOOTLOADER_ACK]),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
-        let mut delay = Delay;
-        let mut stm32 = Stm32::borrowed_with_delay(&mut i2c, &mut delay, CONFIG);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io);
         assert_eq!(stm32.get_chip_id().unwrap(), 0xabcd);
         i2c.done();
     }
@@ -467,8 +414,8 @@ mod tests {
             mock_read(&[BOOTLOADER_ACK]),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
-        let mut delay = Delay;
-        let mut stm32 = Stm32::borrowed_with_delay(&mut i2c, &mut delay, CONFIG);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io);
         assert_eq!(stm32.get_bootloader_version().unwrap(), 0xef);
         i2c.done();
     }
@@ -485,8 +432,8 @@ mod tests {
             mock_read(&[0xab, 0xcd, 0xef]),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
-        let mut delay = Delay;
-        let mut stm32 = Stm32::borrowed_with_delay(&mut i2c, &mut delay, CONFIG);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io);
         let mut out = [0u8; 3];
         stm32.read_memory(0x12345678, &mut out).unwrap();
         assert_eq!(&out, &[0xab, 0xcd, 0xef]);
@@ -504,8 +451,8 @@ mod tests {
             mock_read(&[BOOTLOADER_ACK]),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
-        let mut delay = Delay;
-        let mut stm32 = Stm32::borrowed_with_delay(&mut i2c, &mut delay, CONFIG);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io);
         stm32
             .write_memory(0x12345678, &[0xab, 0xcd, 0xef, 0x12])
             .unwrap();
@@ -521,8 +468,8 @@ mod tests {
             mock_read(&[BOOTLOADER_ACK]),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
-        let mut delay = Delay;
-        let mut stm32 = Stm32::borrowed_with_delay(&mut i2c, &mut delay, CONFIG);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io);
         stm32.go(0x12345678).unwrap();
         i2c.done();
     }
@@ -549,8 +496,8 @@ mod tests {
             mock_read(&[BOOTLOADER_ACK]),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
-        let mut delay = Delay;
-        let mut stm32 = Stm32::borrowed_with_delay(&mut i2c, &mut delay, CONFIG);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io);
         let mut callback_count = 0;
         stm32
             .write_bulk(0x12345678, &to_write, |_| {
@@ -581,8 +528,8 @@ mod tests {
             mock_read(&to_verify[128..]),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
-        let mut delay = Delay;
-        let mut stm32 = Stm32::borrowed_with_delay(&mut i2c, &mut delay, CONFIG);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io);
         let mut callback_count = 0;
         stm32
             .verify(0x12345678, &to_verify, |_| {
@@ -590,6 +537,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(callback_count, 2);
+        stm32.release();
         i2c.done();
     }
 }
