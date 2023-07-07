@@ -1,3 +1,4 @@
+#![deny(missing_docs, unsafe_code)]
 // Copyright 2022 The stm32-bootloader-client-rs Authors.
 // This project is dual-licensed under Apache 2.0 and MIT terms.
 // See LICENSE-APACHE and LICENSE-MIT for details.
@@ -43,30 +44,46 @@ enum Command {
 
 const SPECIAL_ERASE_ALL: [u8; 2] = [0xff, 0xff];
 
+/// Maximume size that can be read or written throgh read/write calls
 pub const MAX_READ_WRITE_SIZE: usize = 128;
 
 type Result<T, E = Error> = core::result::Result<T, E>;
 
+/// Errors that can be encountered and reported
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
+    /// Error in the transport layer
     TransportError,
+    /// Nack was received
     Nack,
+    /// Command produced an unexpected Nack
     NackFromCommand(u8),
+    /// Device busy
     Busy,
+    /// Unexpected response was encountered
     UnexpectedResponse,
+    /// Invalid arguments were provided
     InvalidArgument,
+    /// Verification failure
     VerifyFailedAtAddress(u32),
+    /// Erase failed
     EraseFailed,
 }
 
+/// Trait that encapsulates IO to the STM32 bootloader
 pub trait BootloaderIO<'a> {
+    /// Write given bytes to IO device
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
+    /// Read to buffer from IO device
     fn read(&mut self, out: &mut [u8]) -> Result<()>;
+    /// Read to buffer with a timeout / retry limit
     fn read_with_timeout(&mut self, out: &mut [u8]) -> Result<()>;
+    /// Get the configured wait time for erase operation
     fn get_config_erase_wait_ms(&self) -> u32;
 }
 
+/// A structure with a borrow to an I2C device that can be used for bootloader IO
 pub struct Stm32i2c<'a, I2c: Write + Read> {
     dev: &'a mut I2c,
     config: Config,
@@ -77,6 +94,7 @@ where
     E: core::fmt::Debug,
     I2c: Write<Error = E> + Read<Error = E>,
 {
+    /// Create a new instance of the I2C bootloader IO structure
     pub fn new(dev: &'a mut I2c, config: Config) -> Self {
         Stm32i2c { dev, config }
     }
@@ -123,14 +141,18 @@ where
     }
 }
 
+/// A generic bootloader Interface that uses the BootloaderIO trait to communicate with the STM32 bootloader
 pub struct Stm32<'a, D: BootloaderIO<'a>> {
     dev: D,
     _phantom: &'a PhantomData<()>,
 }
 
+/// Progress information provided to the callback progress handler
 #[derive(Debug, Clone)]
 pub struct Progress {
+    /// Number of bytes that have been completed
     pub bytes_complete: usize,
+    /// The total number of bytes to transfer or verify
     pub bytes_total: usize,
 }
 
@@ -138,7 +160,7 @@ impl<'a, D> Stm32<'a, D>
 where
     D: BootloaderIO<'a>,
 {
-    /// Borrows both the I2C implementation and a custom delay.
+    /// Borrows both BootloaderIO implementation with a lifetime.
     pub fn new(dev: D) -> Stm32<'a, D> {
         Self {
             dev,
@@ -146,9 +168,10 @@ where
         }
     }
 
-    /// Release any borrows
+    /// Release the BootloaderIO borrow directly.
     pub fn release(self) {}
 
+    /// Obtain the chip ID of the device that the bootloader is running on
     pub fn get_chip_id(&mut self) -> Result<u16> {
         self.send_command(Command::GetId)?;
         // For STM32, the first byte will always be a 1 and the payload will
@@ -341,6 +364,7 @@ impl core::fmt::Display for Error {
 }
 
 impl Config {
+    /// Create a default configuration for i2c IO
     pub const fn i2c_address(i2c_address: u8) -> Self {
         Self {
             i2c_address,
