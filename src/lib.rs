@@ -8,7 +8,6 @@
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 
-use core::marker::PhantomData;
 use embedded_hal::blocking::i2c::Read;
 use embedded_hal::blocking::i2c::Write;
 
@@ -72,7 +71,7 @@ pub enum Error {
 }
 
 /// Trait that encapsulates IO to the STM32 bootloader
-pub trait BootloaderIO<'a> {
+pub trait BootloaderIO {
     /// Write given bytes to IO device
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
     /// Read to buffer from IO device
@@ -100,7 +99,7 @@ where
     }
 }
 
-impl<'a, E, I2c> BootloaderIO<'a> for Stm32i2c<'a, I2c>
+impl<'a, E, I2c> BootloaderIO for Stm32i2c<'a, I2c>
 where
     E: core::fmt::Debug,
     I2c: Write<Error = E> + Read<Error = E>,
@@ -142,9 +141,8 @@ where
 }
 
 /// A generic bootloader Interface that uses the BootloaderIO trait to communicate with the STM32 bootloader
-pub struct Stm32<'a, D: BootloaderIO<'a>> {
+pub struct Stm32<D: BootloaderIO> {
     dev: D,
-    _phantom: &'a PhantomData<()>,
 }
 
 /// Progress information provided to the callback progress handler
@@ -156,16 +154,13 @@ pub struct Progress {
     pub bytes_total: usize,
 }
 
-impl<'a, D> Stm32<'a, D>
+impl<D> Stm32<D>
 where
-    D: BootloaderIO<'a>,
+    D: BootloaderIO,
 {
     /// Borrows both BootloaderIO implementation with a lifetime.
-    pub fn new(dev: D) -> Stm32<'a, D> {
-        Self {
-            dev,
-            _phantom: &PhantomData,
-        }
+    pub fn new(dev: D) -> Stm32<D> {
+        Self { dev }
     }
 
     /// Release the BootloaderIO borrow directly.
