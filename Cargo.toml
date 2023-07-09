@@ -15,6 +15,7 @@ log = { version = "0.4.14", optional = true }
 anyhow = "1.0.38"
 embedded-hal-mock = "0.8.0"
 mcp2221 = "0.1.0"
+serialport = "4.2.0"
 
 [features]
 default = ["std"]

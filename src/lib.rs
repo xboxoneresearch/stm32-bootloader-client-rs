@@ -33,12 +33,37 @@ pub struct Config {
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum Command {
+    GetCommands = 0x00,
     GetVersion = 0x01,
     GetId = 0x02,
     ReadMemory = 0x11,
     Go = 0x21,
     WriteMemory = 0x31,
     Erase = 0x44,
+}
+
+/// STM32 Bootloader version - to accomodate for variations in the protocol
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum ProtocolVersion {
+    /// Version 1.0
+    Version1_0 = 0x10,
+    /// Version 1.1
+    Version1_1 = 0x11,
+    /// Version 3.1
+    Version3_1 = 0x31,
+}
+
+impl ProtocolVersion {
+    /// Obtain protocol version from binary representation if possible.
+    pub fn from_u8(n: u8) -> Option<Self> {
+        match n {
+            0x10 => Some(ProtocolVersion::Version1_0),
+            0x11 => Some(ProtocolVersion::Version1_1),
+            0x31 => Some(ProtocolVersion::Version3_1),
+            _ => None,
+        }
+    }
 }
 
 const SPECIAL_ERASE_ALL: [u8; 2] = [0xff, 0xff];
@@ -68,6 +93,10 @@ pub enum Error {
     VerifyFailedAtAddress(u32),
     /// Erase failed
     EraseFailed,
+    /// Wrong protocol version
+    IncorrectProtocol(ProtocolVersion),
+    /// Could not parse protocol version
+    UnknownProtocol(u8),
 }
 
 /// Trait that encapsulates IO to the STM32 bootloader
@@ -143,6 +172,7 @@ where
 /// A generic bootloader Interface that uses the BootloaderIO trait to communicate with the STM32 bootloader
 pub struct Stm32<D: BootloaderIO> {
     dev: D,
+    version: ProtocolVersion,
 }
 
 /// Progress information provided to the callback progress handler
@@ -159,8 +189,8 @@ where
     D: BootloaderIO,
 {
     /// Borrows both BootloaderIO implementation with a lifetime.
-    pub fn new(dev: D) -> Stm32<D> {
-        Self { dev }
+    pub fn new(dev: D, version: ProtocolVersion) -> Stm32<D> {
+        Self { dev, version }
     }
 
     /// Release the BootloaderIO borrow directly.
@@ -273,13 +303,60 @@ where
         self.get_ack().map_err(|_| Error::EraseFailed)
     }
 
-    /// Returns the version number of the bootloader.
-    pub fn get_bootloader_version(&mut self) -> Result<u8> {
+    // Returns the version number of the bootloader (v1.x)
+    fn get_bootloader_version_v1(&mut self) -> Result<u8> {
         self.send_command(Command::GetVersion)?;
         let mut buffer = [0];
         self.dev.read(&mut buffer)?;
         self.get_ack_for_command(Command::GetVersion)?;
         Ok(buffer[0])
+    }
+
+    // Returns the version number of the bootloader (v3.1)
+    fn get_bootloader_version_v3(&mut self) -> Result<u8> {
+        self.send_command(Command::GetVersion)?;
+        let mut buffer = [0; 3];
+        self.dev.read(&mut buffer)?;
+        self.get_ack_for_command(Command::GetVersion)?;
+        Ok(buffer[0])
+    }
+
+    /// Returns the version number of the bootloader.
+    pub fn get_bootloader_version(&mut self) -> Result<u8> {
+        match self.version {
+            ProtocolVersion::Version1_0 => self.get_bootloader_version_v1(),
+            ProtocolVersion::Version1_1 => self.get_bootloader_version_v1(),
+            ProtocolVersion::Version3_1 => self.get_bootloader_version_v3(),
+        }
+    }
+
+    /// Get the command list to probe the protocol version in a safer way,
+    /// Without requiring prior knowledge of the version on the remote end
+    /// Will also optionally report if a specific command is supported,
+    /// as well as mismatch to the selected protocol version
+    pub fn is_command_supported(&mut self, command: u8) -> Result<(ProtocolVersion, bool)> {
+        self.send_command(Command::GetCommands)?;
+        let mut num_bytes = [0];
+        self.dev.read(&mut num_bytes)?;
+        let num_bytes = num_bytes[0] as usize + 1;
+        let mut cmd_list_buffer = [0; MAX_READ_WRITE_SIZE];
+        if num_bytes > 0 && num_bytes <= cmd_list_buffer.len() {
+            self.dev.read(&mut cmd_list_buffer[..num_bytes])?;
+        } else {
+            return Err(Error::InvalidArgument);
+        }
+        self.get_ack()?;
+        let version = ProtocolVersion::from_u8(cmd_list_buffer[0])
+            .ok_or(Error::UnknownProtocol(cmd_list_buffer[0]))?;
+        if version != self.version {
+            // Report the version that was reported from boot loader
+            return Err(Error::IncorrectProtocol(version));
+        }
+
+        Ok((
+            version,
+            (num_bytes > 1 && cmd_list_buffer[..num_bytes].iter().any(|c| *c == command)),
+        ))
     }
 
     /// Exit system bootloader by jumping to the reset vector specified in the
@@ -354,6 +431,8 @@ impl core::fmt::Display for Error {
                 write!(f, "Verify failed at address {:x}", address)
             }
             Error::EraseFailed => write!(f, "Erase failed"),
+            Error::UnknownProtocol(pv) => write!(f, "Unknown protocol version {:02x}", pv),
+            Error::IncorrectProtocol(pv) => write!(f, "Incorrect protocol version {:?}", pv),
         }
     }
 }
@@ -419,7 +498,7 @@ mod tests {
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
-        let mut stm32 = Stm32::new(boot_io);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         assert_eq!(stm32.get_chip_id().unwrap(), 0xabcd);
         i2c.done();
     }
@@ -434,7 +513,7 @@ mod tests {
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
-        let mut stm32 = Stm32::new(boot_io);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         assert_eq!(stm32.get_bootloader_version().unwrap(), 0xef);
         i2c.done();
     }
@@ -452,7 +531,7 @@ mod tests {
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
-        let mut stm32 = Stm32::new(boot_io);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         let mut out = [0u8; 3];
         stm32.read_memory(0x12345678, &mut out).unwrap();
         assert_eq!(&out, &[0xab, 0xcd, 0xef]);
@@ -471,7 +550,7 @@ mod tests {
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
-        let mut stm32 = Stm32::new(boot_io);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         stm32
             .write_memory(0x12345678, &[0xab, 0xcd, 0xef, 0x12])
             .unwrap();
@@ -488,7 +567,7 @@ mod tests {
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
-        let mut stm32 = Stm32::new(boot_io);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         stm32.go(0x12345678).unwrap();
         i2c.done();
     }
@@ -516,7 +595,7 @@ mod tests {
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
-        let mut stm32 = Stm32::new(boot_io);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         let mut callback_count = 0;
         stm32
             .write_bulk(0x12345678, &to_write, |_| {
@@ -548,7 +627,7 @@ mod tests {
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
-        let mut stm32 = Stm32::new(boot_io);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         let mut callback_count = 0;
         stm32
             .verify(0x12345678, &to_verify, |_| {
