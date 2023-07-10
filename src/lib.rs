@@ -11,6 +11,10 @@
 use embedded_hal::blocking::i2c::Read;
 use embedded_hal::blocking::i2c::Write;
 
+type Word = u8;
+use embedded_hal::serial::Read as URead;
+use embedded_hal::serial::Write as UWrite;
+
 const BOOTLOADER_ACK: u8 = 0x79;
 const BOOTLOADER_NACK: u8 = 0x1f;
 const BOOTLOADER_BUSY: u8 = 0x76;
@@ -169,6 +173,92 @@ where
     }
 }
 
+/// A structure with a borrow to an UART device that can be used for bootloader IO
+pub struct Stm32Uart<'a, U: UWrite<Word> + URead<Word>> {
+    dev: &'a mut U,
+    config: Config,
+}
+
+impl<'a, E, U> Stm32Uart<'a, U>
+where
+    E: core::fmt::Debug,
+    U: UWrite<Word, Error = E> + URead<Word, Error = E>,
+{
+    /// Create a new instance of the I2C bootloader IO structure
+    pub fn new(dev: &'a mut U, config: Config) -> Self {
+        Stm32Uart { dev, config }
+    }
+}
+
+impl<'a, E, U> Stm32Uart<'a, U>
+where
+    E: core::fmt::Debug,
+    U: UWrite<Word, Error = E> + URead<Word, Error = E>,
+{
+    /// Attempt to do the auto baud rate exchange
+    pub fn auto_baud(&mut self) -> Result<()> {
+        self.write(&[0x7f])?;
+        let mut buf = [0];
+        self.read(&mut buf)?;
+        if buf[0] == 0x79 {
+            Ok(())
+        } else {
+            Err(Error::TransportError)
+        }
+    }
+}
+
+impl<'a, E, U> BootloaderIO for Stm32Uart<'a, U>
+where
+    E: core::fmt::Debug,
+    U: UWrite<Word, Error = E> + URead<Word, Error = E>,
+{
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        for b in bytes {
+            while self.dev.write(*b).is_err() {}
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<()> {
+        for ob in out.iter_mut() {
+            let mut retries = 250000;
+            loop {
+                match self.dev.read() {
+                    Ok(b) => {
+                        *ob = b;
+                        break;
+                    }
+                    Err(_) => {
+                        if retries == 0 {
+                            return Err(Error::TransportError);
+                        }
+                        retries -= 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_with_timeout(&mut self, out: &mut [u8]) -> Result<()> {
+        // TODO: Implement timeout mechanism
+        const MAX_ATTEMPTS: u32 = 100;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let result = self.read(out);
+            if result.is_ok() || attempts == MAX_ATTEMPTS {
+                return result;
+            }
+        }
+    }
+
+    fn get_config_erase_wait_ms(&self) -> u32 {
+        self.config.mass_erase_max_ms
+    }
+}
+
 /// A generic bootloader Interface that uses the BootloaderIO trait to communicate with the STM32 bootloader
 pub struct Stm32<D: BootloaderIO> {
     dev: D,
@@ -192,9 +282,6 @@ where
     pub fn new(dev: D, version: ProtocolVersion) -> Stm32<D> {
         Self { dev, version }
     }
-
-    /// Release the BootloaderIO borrow directly.
-    pub fn release(self) {}
 
     /// Obtain the chip ID of the device that the bootloader is running on
     pub fn get_chip_id(&mut self) -> Result<u16> {
@@ -635,7 +722,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(callback_count, 2);
-        stm32.release();
         i2c.done();
     }
 }
