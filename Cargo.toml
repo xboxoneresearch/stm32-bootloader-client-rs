@@ -7,13 +7,14 @@ edition = "2021"
 license = "BSD-3-Clause"
 
 [dependencies]
-embedded-hal = "0.2.6"
-defmt = { version = "0.2.1", optional = true }
-log = { version = "0.4.14", optional = true }
+embedded-hal = "1.0.0"
+defmt = { version = "1.0.1", optional = true }
+log = { version = "0.4.28", optional = true }
+embedded-io = "0.6.1"
 
 [dev-dependencies]
 anyhow = "1.0.38"
-embedded-hal-mock = "0.8.0"
+embedded-hal-mock = "0.11.1"
 mcp2221 = "0.1.0"
 serialport = "4.2.0"
 

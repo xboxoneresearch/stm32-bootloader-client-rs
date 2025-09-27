@@ -72,8 +72,8 @@ impl BootloaderIO for StmSerial {
     }
 
     /// Get the configured wait time for erase operation
-    fn get_config_erase_wait_ms(&self) -> u32 {
-        100
+    fn get_config_erase_wait_ns(&self) -> u64 {
+        100_000_000
     }
 }
 
