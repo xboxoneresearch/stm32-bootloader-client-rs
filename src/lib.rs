@@ -373,13 +373,37 @@ where
         Ok(())
     }
 
-    /// Erase the flash of the STM32.
+    /// Erase the whole flash of the STM32.
     pub fn erase_flash(&mut self, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
         self.send_command(Command::Erase)?;
         let mut buffer = [0u8; 3];
         buffer[0..2].copy_from_slice(&SPECIAL_ERASE_ALL);
         buffer[2] = checksum(&buffer[..2]);
         self.dev.write(&buffer)?;
+        delay_ns(self.dev.get_config_erase_wait_ns());
+        self.get_ack().map_err(|_| Error::EraseFailed)
+    }
+
+    /// Erase single pages of the STM32.
+    pub fn erase_pages(&mut self, pages: &[u16], delay_ns: &mut dyn Fn(u64)) -> Result<()> {
+        assert!(pages.len() >= 1);
+        self.send_command(Command::Erase)?;
+
+        // submit number of pages to erase
+        let page_count = (pages.len() - 1) as u16;
+        let mut buffer = [0u8; 3];
+        buffer[0..2].copy_from_slice(&page_count.to_be_bytes());
+        buffer[2] = checksum(&buffer[..2]);
+        self.dev.write(&buffer)?;
+        self.get_ack().map_err(|_| Error::EraseFailed)?;
+        
+        // submit actual page numbers
+        let mut pages_buffer = vec![0u8; (pages.len() * 2) + 1];
+        for (buf_index, page)  in pages.iter().enumerate() {
+            pages_buffer[buf_index * 2..(buf_index * 2) + 2].copy_from_slice(&page.to_be_bytes());
+        }
+        pages_buffer[pages.len() * 2] = checksum(&pages_buffer[..pages.len() * 2]);
+        self.dev.write(&pages_buffer)?;
         delay_ns(self.dev.get_config_erase_wait_ns());
         self.get_ack().map_err(|_| Error::EraseFailed)
     }
@@ -684,6 +708,65 @@ mod tests {
             })
             .unwrap();
         assert_eq!(callback_count, 2);
+        i2c.done();
+    }
+
+    #[test]
+    fn test_erase_flash() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::Erase as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0xFF, 0xFF]),
+            mock_read(&[BOOTLOADER_ACK])
+        ];
+
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .erase_flash(&mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+
+    #[test]
+    fn test_erase_page_one() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::Erase as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x00]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x01]),
+            mock_read(&[BOOTLOADER_ACK])
+        ];
+
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .erase_pages(&[1], &mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+    #[test]
+    fn test_erase_page_one_and_two() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::Erase as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x01]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x01, 0x00, 0x02]),
+            mock_read(&[BOOTLOADER_ACK])
+        ];
+
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .erase_pages(&[1, 2], &mut |_| {})
+            .unwrap();
         i2c.done();
     }
 
