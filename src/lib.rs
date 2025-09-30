@@ -8,12 +8,10 @@
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 
-use embedded_hal::blocking::i2c::Read;
-use embedded_hal::blocking::i2c::Write;
+use embedded_hal::i2c::I2c;
 
-type Word = u8;
-use embedded_hal::serial::Read as URead;
-use embedded_hal::serial::Write as UWrite;
+use embedded_io::Read;
+use embedded_io::Write;
 
 const BOOTLOADER_ACK: u8 = 0x79;
 const BOOTLOADER_NACK: u8 = 0x1f;
@@ -28,10 +26,10 @@ pub struct Config {
     /// connected to.
     i2c_address: u8,
 
-    /// The maximum number of milliseconds that a full flash erase can take.
+    /// The maximum number of nanoseconds that a full flash erase can take.
     /// Search the datasheet for your specific STM32 for "mass erase time". If
     /// in doubt, round up.
-    pub mass_erase_max_ms: u32,
+    pub mass_erase_max_ns: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -112,30 +110,28 @@ pub trait BootloaderIO {
     /// Read to buffer with a timeout / retry limit
     fn read_with_timeout(&mut self, out: &mut [u8]) -> Result<()>;
     /// Get the configured wait time for erase operation
-    fn get_config_erase_wait_ms(&self) -> u32;
+    fn get_config_erase_wait_ns(&self) -> u64;
 }
 
 /// A structure with a borrow to an I2C device that can be used for bootloader IO
-pub struct Stm32i2c<'a, I2c: Write + Read> {
-    dev: &'a mut I2c,
+pub struct Stm32i2c<I2C: I2c> {
+    dev: I2C,
     config: Config,
 }
 
-impl<'a, E, I2c> Stm32i2c<'a, I2c>
-where
-    E: core::fmt::Debug,
-    I2c: Write<Error = E> + Read<Error = E>,
+impl<I2cImpl> Stm32i2c<I2cImpl>
+    where
+        I2cImpl: I2c
 {
     /// Create a new instance of the I2C bootloader IO structure
-    pub fn new(dev: &'a mut I2c, config: Config) -> Self {
+    pub fn new(dev: I2cImpl, config: Config) -> Self {
         Stm32i2c { dev, config }
     }
 }
 
-impl<'a, E, I2c> BootloaderIO for Stm32i2c<'a, I2c>
+impl<I2cImpl> BootloaderIO for Stm32i2c<I2cImpl>
 where
-    E: core::fmt::Debug,
-    I2c: Write<Error = E> + Read<Error = E>,
+    I2cImpl: I2c
 {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.dev
@@ -168,13 +164,13 @@ where
         }
     }
 
-    fn get_config_erase_wait_ms(&self) -> u32 {
-        self.config.mass_erase_max_ms
+    fn get_config_erase_wait_ns(&self) -> u64 {
+        self.config.mass_erase_max_ns
     }
 }
 
 /// A structure with a borrow to an UART device that can be used for bootloader IO
-pub struct Stm32Uart<'a, U: UWrite<Word> + URead<Word>> {
+pub struct Stm32Uart<'a, U: Write + Read> {
     dev: &'a mut U,
     config: Config,
 }
@@ -182,7 +178,7 @@ pub struct Stm32Uart<'a, U: UWrite<Word> + URead<Word>> {
 impl<'a, E, U> Stm32Uart<'a, U>
 where
     E: core::fmt::Debug,
-    U: UWrite<Word, Error = E> + URead<Word, Error = E>,
+    U: Write<Error = E> + Read<Error = E>,
 {
     /// Create a new instance of the I2C bootloader IO structure
     pub fn new(dev: &'a mut U, config: Config) -> Self {
@@ -193,7 +189,7 @@ where
 impl<'a, E, U> Stm32Uart<'a, U>
 where
     E: core::fmt::Debug,
-    U: UWrite<Word, Error = E> + URead<Word, Error = E>,
+    U: Write<Error = E> + Read<Error = E>,
 {
     /// Attempt to do the auto baud rate exchange
     pub fn auto_baud(&mut self) -> Result<()> {
@@ -211,30 +207,28 @@ where
 impl<'a, E, U> BootloaderIO for Stm32Uart<'a, U>
 where
     E: core::fmt::Debug,
-    U: UWrite<Word, Error = E> + URead<Word, Error = E>,
+    U: Write<Error = E> + Read<Error = E>,
 {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        for b in bytes {
-            while self.dev.write(*b).is_err() {}
+        for index in 0..bytes.len() {
+            while self.dev.write(&bytes[index..index + 1]).is_err() {}
         }
+        
         Ok(())
     }
 
     fn read(&mut self, out: &mut [u8]) -> Result<()> {
-        for ob in out.iter_mut() {
+        for index in 0..out.len() {
             let mut retries = 250000;
             loop {
-                match self.dev.read() {
-                    Ok(b) => {
-                        *ob = b;
-                        break;
-                    }
+                match self.dev.read(&mut out[index..index + 1]) {
+                    Ok(_) => break,
                     Err(_) => {
                         if retries == 0 {
                             return Err(Error::TransportError);
                         }
                         retries -= 1;
-                    }
+                    },
                 }
             }
         }
@@ -254,8 +248,8 @@ where
         }
     }
 
-    fn get_config_erase_wait_ms(&self) -> u32 {
-        self.config.mass_erase_max_ms
+    fn get_config_erase_wait_ns(&self) -> u64 {
+        self.config.mass_erase_max_ns
     }
 }
 
@@ -380,13 +374,13 @@ where
     }
 
     /// Erase the flash of the STM32.
-    pub fn erase_flash(&mut self, delay_ms: &mut dyn Fn(u32)) -> Result<()> {
+    pub fn erase_flash(&mut self, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
         self.send_command(Command::Erase)?;
         let mut buffer = [0u8; 3];
         buffer[0..2].copy_from_slice(&SPECIAL_ERASE_ALL);
         buffer[2] = checksum(&buffer[..2]);
         self.dev.write(&buffer)?;
-        delay_ms(self.dev.get_config_erase_wait_ms());
+        delay_ns(self.dev.get_config_erase_wait_ns());
         self.get_ack().map_err(|_| Error::EraseFailed)
     }
 
@@ -492,9 +486,9 @@ where
 pub struct StdDelay;
 
 #[cfg(feature = "std")]
-impl embedded_hal::blocking::delay::DelayMs<u32> for StdDelay {
-    fn delay_ms(&mut self, ms: u32) {
-        std::thread::sleep(std::time::Duration::from_millis(ms.into()));
+impl embedded_hal::delay::DelayNs for StdDelay {
+    fn delay_ns(&mut self, ns: u32) {
+        std::thread::sleep(std::time::Duration::from_nanos(ns.into()));
     }
 }
 
@@ -531,7 +525,7 @@ impl Config {
             i2c_address,
             // A moderately conservative default. stm32g071 has 40.1ms.
             // stm32l452 has 24.59ms
-            mass_erase_max_ms: 200,
+            mass_erase_max_ns: 200_000_000,
         }
     }
 }
@@ -553,7 +547,7 @@ fn log_error<E: core::fmt::Debug>(_error: &E) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embedded_hal_mock::i2c;
+    use embedded_hal_mock::eh1::i2c;
 
     const I2C_ADDRESS: u8 = 0x51;
     const CONFIG: Config = Config::i2c_address(I2C_ADDRESS);
@@ -571,8 +565,8 @@ mod tests {
 
     struct Delay;
 
-    impl embedded_hal::blocking::delay::DelayMs<u32> for Delay {
-        fn delay_ms(&mut self, _ms: u32) {}
+    impl embedded_hal::delay::DelayNs for Delay {
+        fn delay_ns(&mut self, _ms: u32) {}
     }
 
     #[test]
