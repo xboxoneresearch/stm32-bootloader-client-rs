@@ -42,6 +42,12 @@ enum Command {
     Go = 0x21,
     WriteMemory = 0x31,
     Erase = 0x44,
+    WriteProtect = 0x63,
+    WriteUnprotect = 0x73,
+    ReadoutProtect = 0x82,
+    ReadoutUnprotect = 0x92,
+    // No-Stretch command
+    GetMemoryChecksumNS = 0xA1,
 }
 
 /// STM32 Bootloader version - to accomodate for variations in the protocol
@@ -87,6 +93,10 @@ pub enum Error {
     NackFromCommand(u8),
     /// Device busy
     Busy,
+    /// Checksum command failed
+    ChecksumCommandError,
+    /// NoStretch Command timed out
+    CommandTimeout,
     /// Unexpected response was encountered
     UnexpectedResponse,
     /// Invalid arguments were provided
@@ -373,7 +383,7 @@ where
         Ok(())
     }
 
-    /// Erase the flash of the STM32.
+    /// Erase the whole flash of the STM32.
     pub fn erase_flash(&mut self, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
         self.send_command(Command::Erase)?;
         let mut buffer = [0u8; 3];
@@ -383,6 +393,91 @@ where
         delay_ns(self.dev.get_config_erase_wait_ns());
         self.get_ack().map_err(|_| Error::EraseFailed)
     }
+
+    /// Erase single pages of the STM32.
+    pub fn erase_pages(&mut self, pages: &[u16], delay_ns: &mut dyn Fn(u64)) -> Result<()> {
+        assert!(pages.len() >= 1);
+        self.send_command(Command::Erase)?;
+
+        // submit number of pages to erase
+        let page_count = (pages.len() - 1) as u16;
+        let mut buffer = [0u8; 3];
+        buffer[0..2].copy_from_slice(&page_count.to_be_bytes());
+        buffer[2] = checksum(&buffer[..2]);
+        self.dev.write(&buffer)?;
+        self.get_ack().map_err(|_| Error::EraseFailed)?;
+
+        // submit actual page numbers
+        let mut pages_buffer = vec![0u8; (pages.len() * 2) + 1];
+        for (buf_index, page)  in pages.iter().enumerate() {
+            pages_buffer[buf_index * 2..(buf_index * 2) + 2].copy_from_slice(&page.to_be_bytes());
+        }
+        pages_buffer[pages.len() * 2] = checksum(&pages_buffer[..pages.len() * 2]);
+        self.dev.write(&pages_buffer)?;
+        delay_ns(self.dev.get_config_erase_wait_ns());
+        self.get_ack().map_err(|_| Error::EraseFailed)
+    }
+
+    /// Write protect sectors
+    pub fn write_protect(&mut self, sectors: &[u8], delay_ns: &mut dyn Fn(u64)) -> Result<()> {
+        self.send_command(Command::WriteProtect)?;
+        
+        let mut buffer = [0u8; 2];
+        buffer[0] = sectors.len() as u8;
+        buffer[1] = checksum(&buffer[0..1]);
+        self.dev.write(&buffer)?;
+        self.get_ack_for_command(Command::WriteProtect)?;
+
+        let mut buffer = vec![0u8; sectors.len() + 1];
+        buffer[0..sectors.len()].copy_from_slice(&sectors);
+        buffer[sectors.len()] = checksum(&buffer[..sectors.len()]);
+        self.dev.write(&buffer)?;
+        delay_ns(self.dev.get_config_erase_wait_ns());
+        self.get_ack_for_command(Command::WriteProtect)
+    }
+
+    /// Deactivate write protection globally
+    pub fn write_unprotect(&mut self, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
+        self.send_command(Command::WriteUnprotect)?;
+        delay_ns(self.dev.get_config_erase_wait_ns());
+        self.get_ack_for_command(Command::WriteUnprotect)
+    }
+
+    /// Activate readout protection
+    pub fn readout_protect(&mut self, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
+        self.send_command(Command::ReadoutProtect)?;
+        delay_ns(self.dev.get_config_erase_wait_ns());
+        self.get_ack_for_command(Command::ReadoutProtect)
+    }
+
+    /// Deactivate readout protection
+    pub fn readout_unprotect(&mut self, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
+        self.send_command(Command::ReadoutUnprotect)?;
+        delay_ns(self.dev.get_config_erase_wait_ns());
+        self.get_ack_for_command(Command::ReadoutUnprotect)
+    }
+
+    /*
+    /// Calculate checksum over specified memory area
+    pub fn get_memory_checksum(&mut self, address: u32, length: u32) -> Result<u32> {
+        self.send_command(Command::GetMemoryChecksumNS)?;
+        // Address
+        self.send_address(address).map_err(|_|Error::ChecksumCommandError)?;
+        // Size
+        self.send_address(length).map_err(|_|Error::ChecksumCommandError)?;
+
+        let mut resp = [0u8; 5];
+        resp[0] = BOOTLOADER_BUSY;
+        while resp[0] == BOOTLOADER_BUSY {
+            // TODO: Sleep
+            self.dev.read(&mut resp[..1])?;
+        }
+
+        self.dev.read(&mut resp).map_err(|_|Error::CommandTimeout)?;
+        assert_eq!(checksum(&resp[..4]), resp[4]);
+        Ok(u32::from_be_bytes(resp[..4].try_into().unwrap()))
+    }
+    */
 
     // Returns the version number of the bootloader (v1.x)
     fn get_bootloader_version_v1(&mut self) -> Result<u8> {
@@ -506,6 +601,8 @@ impl core::fmt::Display for Error {
             Error::Nack => write!(f, "NACK"),
             Error::NackFromCommand(command) => write!(f, "Nack from command {}", command),
             Error::Busy => write!(f, "Busy"),
+            Error::ChecksumCommandError => write!(f, "Checksum command error"),
+            Error::CommandTimeout => write!(f, "NoStretch command timed out"),
             Error::UnexpectedResponse => write!(f, "Unexpected response"),
             Error::InvalidArgument => write!(f, "Invalid argument"),
             Error::VerifyFailedAtAddress(address) => {
@@ -686,6 +783,158 @@ mod tests {
         assert_eq!(callback_count, 2);
         i2c.done();
     }
+
+    #[test]
+    fn test_erase_flash() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::Erase as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0xFF, 0xFF]),
+            mock_read(&[BOOTLOADER_ACK])
+        ];
+
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .erase_flash(&mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+
+    #[test]
+    fn test_erase_page_one() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::Erase as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x00]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x01]),
+            mock_read(&[BOOTLOADER_ACK])
+        ];
+
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .erase_pages(&[1], &mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+    #[test]
+    fn test_erase_page_one_and_two() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::Erase as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x01]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x01, 0x00, 0x02]),
+            mock_read(&[BOOTLOADER_ACK])
+        ];
+
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .erase_pages(&[1, 2], &mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+    #[test]
+    fn test_write_protect() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::WriteProtect as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x03]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[2, 5, 9]),
+            mock_read(&[BOOTLOADER_ACK])
+        ];
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .write_protect(&[2, 5, 9], &mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+    #[test]
+    fn test_write_unprotect() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::WriteUnprotect as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_read(&[BOOTLOADER_ACK]),
+        ];
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .write_unprotect(&mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+    #[test]
+    fn test_readout_protect() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::ReadoutProtect as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_read(&[BOOTLOADER_ACK]),
+        ];
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .readout_protect(&mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+    #[test]
+    fn test_readout_unprotect() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::ReadoutUnprotect as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_read(&[BOOTLOADER_ACK]),
+        ];
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        stm32
+            .readout_unprotect(&mut |_| {})
+            .unwrap();
+        i2c.done();
+    }
+
+    /*
+    #[test]
+    fn test_get_memory_checksum() {
+        let expectations = [
+            mock_write_with_checksum(&[Command::GetMemoryChecksumNS as u8]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x12, 0x34, 0x56, 0x78]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_write_with_checksum(&[0x00, 0x00, 0x01, 0x23]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_read(&[BOOTLOADER_BUSY]),
+            mock_read(&[BOOTLOADER_BUSY]),
+            mock_read(&[BOOTLOADER_BUSY]),
+            mock_read(&[0xF0, 0xF1, 0xF2, 0xF3, 0x00]),
+        ];
+        let mut i2c = i2c::Mock::new(&expectations);
+        let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
+        let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
+        let checksum = stm32
+            .get_memory_checksum(0x12345678, 0x123)
+            .unwrap();
+        assert_eq!(checksum, 0x00000000);
+        i2c.done();
+    }
+    */
 
     #[test]
     fn test_verify() {
