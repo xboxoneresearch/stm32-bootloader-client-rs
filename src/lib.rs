@@ -111,6 +111,24 @@ pub enum Error {
     UnknownProtocol(u8),
 }
 
+/// Calculate CRC32/MPEG-2
+/// Data fed in byte-reversed u32-chunks
+pub fn calculate_crc32(buf: &[u8]) -> Result<u32> {
+    // Ensure 4 byte alignment
+    assert_eq!(buf.len() % 4, 0);
+
+    const ALGO: crc::Algorithm<u32> = crc::CRC_32_MPEG_2;
+    let context = crc::Crc::<u32>::new(&ALGO);
+
+    let mut digest = context.digest();
+    for uint32 in (0..buf.len()).step_by(size_of::<u32>()) {
+        let mut value = buf[uint32..uint32 + size_of::<u32>()].to_vec();
+        value.reverse();
+        digest.update(&value);
+    }
+    Ok(digest.finalize())
+}
+
 /// Trait that encapsulates IO to the STM32 bootloader
 pub trait BootloaderIO {
     /// Write given bytes to IO device
@@ -418,6 +436,29 @@ where
         self.get_ack().map_err(|_| Error::EraseFailed)
     }
 
+    /// Calculate CRC32 over specified memory section
+    pub fn get_memory_checksum(&mut self, adress: u32, length: u32) -> Result<u32> {
+
+        self.send_command(Command::GetMemoryChecksumNS)?;
+        // Address
+        self.send_address(adress).map_err(|_| Error::ChecksumCommandError)?;
+        // Size
+        self.send_address(length).map_err(|_| Error::ChecksumCommandError)?;
+
+        let mut resp = [0u8; 5];
+        resp[0] = BOOTLOADER_BUSY;
+        while resp[0] == BOOTLOADER_BUSY {
+            self.dev.read(&mut resp[..1])?;
+        }
+
+        self.dev.read(&mut resp).map_err(|_| Error::CommandTimeout)?;
+        if checksum(&resp[..4]) != resp[4] {
+            return Err(Error::ChecksumCommandError);
+        }
+
+        Ok(u32::from_be_bytes(resp[..4].try_into().unwrap()))
+    }
+
     /// Write protect sectors
     pub fn write_protect(&mut self, sectors: &[u8], delay_ns: &mut dyn Fn(u64)) -> Result<()> {
         self.send_command(Command::WriteProtect)?;
@@ -456,28 +497,6 @@ where
         delay_ns(self.dev.get_config_erase_wait_ns());
         self.get_ack_for_command(Command::ReadoutUnprotect)
     }
-
-    /*
-    /// Calculate checksum over specified memory area
-    pub fn get_memory_checksum(&mut self, address: u32, length: u32) -> Result<u32> {
-        self.send_command(Command::GetMemoryChecksumNS)?;
-        // Address
-        self.send_address(address).map_err(|_|Error::ChecksumCommandError)?;
-        // Size
-        self.send_address(length).map_err(|_|Error::ChecksumCommandError)?;
-
-        let mut resp = [0u8; 5];
-        resp[0] = BOOTLOADER_BUSY;
-        while resp[0] == BOOTLOADER_BUSY {
-            // TODO: Sleep
-            self.dev.read(&mut resp[..1])?;
-        }
-
-        self.dev.read(&mut resp).map_err(|_|Error::CommandTimeout)?;
-        assert_eq!(checksum(&resp[..4]), resp[4]);
-        Ok(u32::from_be_bytes(resp[..4].try_into().unwrap()))
-    }
-    */
 
     // Returns the version number of the bootloader (v1.x)
     fn get_bootloader_version_v1(&mut self) -> Result<u8> {
@@ -910,31 +929,36 @@ mod tests {
         i2c.done();
     }
 
-    /*
     #[test]
     fn test_get_memory_checksum() {
+        let mut checksum_bytes = calculate_crc32(b"ABCDEFGH")
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+    
+        checksum_bytes.push(checksum(&checksum_bytes));
         let expectations = [
             mock_write_with_checksum(&[Command::GetMemoryChecksumNS as u8]),
             mock_read(&[BOOTLOADER_ACK]),
-            mock_write_with_checksum(&[0x12, 0x34, 0x56, 0x78]),
+            mock_write_with_checksum(&[0x08, 0x00, 0x00, 0x00]),
             mock_read(&[BOOTLOADER_ACK]),
-            mock_write_with_checksum(&[0x00, 0x00, 0x01, 0x23]),
+            mock_write_with_checksum(&[0x00, 0x00, 0x00, 0x08]),
             mock_read(&[BOOTLOADER_ACK]),
             mock_read(&[BOOTLOADER_BUSY]),
             mock_read(&[BOOTLOADER_BUSY]),
             mock_read(&[BOOTLOADER_BUSY]),
-            mock_read(&[0xF0, 0xF1, 0xF2, 0xF3, 0x00]),
+            mock_read(&[BOOTLOADER_ACK]),
+            mock_read(&checksum_bytes),
         ];
         let mut i2c = i2c::Mock::new(&expectations);
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
         let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         let checksum = stm32
-            .get_memory_checksum(0x12345678, 0x123)
+            .get_memory_checksum(0x0800_0000, 8)
             .unwrap();
-        assert_eq!(checksum, 0x00000000);
+        assert_eq!(checksum, 0x8DCBFB33);
         i2c.done();
     }
-    */
 
     #[test]
     fn test_verify() {
