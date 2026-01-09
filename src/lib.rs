@@ -401,6 +401,20 @@ where
         Ok(())
     }
 
+    /// Verifies that memory at `address` is equal to `bytes` via hardware CRC32
+    pub fn verify_crc(
+        &mut self,
+        address: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let chksum_stm = self.get_memory_checksum(address, bytes.len() as u32)?;
+        let chksum_local = calculate_crc32(&bytes)?;
+        if chksum_stm != chksum_local {
+            return Err(Error::VerifyFailedAtAddress(address));
+        }
+        Ok(())
+    }
+
     /// Erase the whole flash of the STM32.
     pub fn erase_flash(&mut self, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
         self.send_command(Command::Erase)?;
@@ -413,32 +427,38 @@ where
     }
 
     /// Erase single pages of the STM32.
-    pub fn erase_pages(&mut self, pages: &[u16], delay_ns: &mut dyn Fn(u64)) -> Result<()> {
-        assert!(pages.len() >= 1);
+    pub fn erase_pages(&mut self, start_page: u16, page_count: u16, delay_ns: &mut dyn Fn(u64)) -> Result<()> {
+        let pages = start_page..(start_page + page_count);
+
+        if pages.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
         self.send_command(Command::Erase)?;
 
-        // submit number of pages to erase
-        let page_count = (pages.len() - 1) as u16;
-        let mut buffer = [0u8; 3];
-        buffer[0..2].copy_from_slice(&page_count.to_be_bytes());
-        buffer[2] = checksum(&buffer[..2]);
-        self.dev.write(&buffer)?;
-        self.get_ack().map_err(|_| Error::EraseFailed)?;
+        // Send number of pages minus one as two-byte big-endian + checksum
+        let count_be = ((page_count - 1) as u16).to_be_bytes();
+        let mut count_packet = [0u8; 3];
+        count_packet[..2].copy_from_slice(&count_be);
+        count_packet[2] = checksum(&count_packet[..2]);
+        self.dev.write(&count_packet)?;
+        self.get_ack_for_command(Command::Erase)?;
 
-        // submit actual page numbers
-        let mut pages_buffer = vec![0u8; (pages.len() * 2) + 1];
-        for (buf_index, page)  in pages.iter().enumerate() {
-            pages_buffer[buf_index * 2..(buf_index * 2) + 2].copy_from_slice(&page.to_be_bytes());
+        // Build the page list packet: each page as big-endian u16, followed by checksum
+        let mut pages_packet = Vec::with_capacity(page_count as usize * 2 + 1);
+        for page in pages {
+            pages_packet.extend_from_slice(&page.to_be_bytes());
         }
-        pages_buffer[pages.len() * 2] = checksum(&pages_buffer[..pages.len() * 2]);
-        self.dev.write(&pages_buffer)?;
+        let pages_checksum = checksum(&pages_packet);
+        pages_packet.push(pages_checksum);
+        self.dev.write(&pages_packet)?;
+
         delay_ns(self.dev.get_config_erase_wait_ns());
-        self.get_ack().map_err(|_| Error::EraseFailed)
+        self.get_ack_for_command(Command::Erase).map_err(|_| Error::EraseFailed)
     }
 
     /// Calculate CRC32 over specified memory section
     pub fn get_memory_checksum(&mut self, adress: u32, length: u32) -> Result<u32> {
-
         self.send_command(Command::GetMemoryChecksumNS)?;
         // Address
         self.send_address(adress).map_err(|_| Error::ChecksumCommandError)?;
@@ -837,7 +857,7 @@ mod tests {
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
         let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         stm32
-            .erase_pages(&[1], &mut |_| {})
+            .erase_pages(1, 1, &mut |_| {})
             .unwrap();
         i2c.done();
     }
@@ -857,7 +877,7 @@ mod tests {
         let boot_io = Stm32i2c::new(&mut i2c, CONFIG);
         let mut stm32 = Stm32::new(boot_io, ProtocolVersion::Version1_1);
         stm32
-            .erase_pages(&[1, 2], &mut |_| {})
+            .erase_pages(1, 2, &mut |_| {})
             .unwrap();
         i2c.done();
     }
